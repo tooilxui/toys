@@ -1,0 +1,264 @@
+syntax = "proto3";
+
+package proto.mes;
+
+//option go_package="gitlab.kenda.com.tw/kenda/commons/v2/proto/golang/mes";
+
+// 機台基本資訊透過 incoming context取得 , 此定義不會使用在 Request/Reply
+message Context {
+    string station    = 1;
+    string work_order = 2;
+    string batch      = 3;
+    string worker     = 4;
+}
+
+/*
+    definition of action:
+    1. LOOKUP : 取Resource資訊
+        1.2 當Context包含工單號碼&機台時，檢查該Resource是否符合工單需求，回傳的數量則為配合表用量，非庫存量
+        1.3 當auto_push = true 時主動將材料掛載至桶槽。Slot有資料則依Slot掛載，沒有則依配合維護桶位掛載
+
+    3. ADD : 紀錄作業員, 工單, 首, 材料用量
+        3.1 從Context取得機台, 作業員工號, 工單ID, 首編號
+        3.2 將材料寫入DB進行暫存 (Wait For Start)
+        3.3 commit == True 時檢查 中央供應材料數量是否足夠 , 治工具是否到齊
+
+    4. REMOVE  : 刪除指定Slot上的Resource
+    2. REPLACE : 將指定Slot上的Resource 替換成 request Resource
+    5. PUSH    : 往指定Slot推送Resource
+    6. POP     : 拿掉指定Slot的front Resource (FIFO)
+
+    注： 以上所有ACTION預設回傳Resource訊息
+*/
+message Resource {
+    enum TYPE {
+        UNSPECIFIED = 0;
+        TOOL        = 1;
+        MATERIAL    = 2;
+    }
+    TYPE   type   = 1;
+    string lot_id = 2;
+}
+
+message SingleResourceRequest {
+    enum Action {
+        LOOKUP  = 0;
+
+        REPLACE = 1;
+        ADD     = 2;
+        REMOVE  = 3;
+
+        PUSH    = 4;
+        POP     = 5;
+    }
+
+    message Slot {
+        string name  = 1;
+        int32  index = 2;
+    }
+
+    Action   action     = 1;
+    Resource resource   = 2;
+    Slot     slot       = 3;
+    float    quantity   = 4;  // 0.0 if not provided -> use MES server remaining quantity.
+
+    // @cliff when action = LOOKUP: 從context取工單後，確認該材料符合工單就自動掛載
+    bool     auto_push  = 5;  // if true, auto mount on container by recipe information base on work order.  @saxon
+    bool     auto_start = 6;
+}
+
+message ResourceReply {
+
+    enum Status {
+        OK             = 0;
+        NON_EXISTENT   = 1;
+        BAD_LOT_ID     = 2;
+        MISMATCH       = 3;
+        BAD_QUANTITY   = 4;
+        MISSING        = 5;
+        INTERNAL       = 6;
+    }
+
+    enum BadLotIDReasons {
+        UNSPECIFIED_BAD_LOT_ID_REASON = 0;
+        UNAVAILABLE                   = 1;
+        EXPIRED                       = 2;
+        ON_HOLD                       = 3;
+        IN_INSPECTION                 = 4;
+        ALREADY_MOUNTED               = 5;
+        MISS_PRECONDITION             = 6; // 前置作業未完成。 EX: 未切膠
+    }
+
+    enum BadQuantityReasons {
+        UNSPECIFIED_BAD_QUANTITY_REASON = 0;
+        SHORTAGE                        = 1;
+        BELOW_MIS_USAGE                 = 2;
+    }
+
+    enum InternalReasons {
+        UNSPECIFIED_INTERNAL_REASON = 0;
+        WRONG_SHEET_STATUS          = 1;
+        WRONG_WORK_ORDER_STATUS     = 2;
+    }
+
+    Resource requested_resource = 1; // Resource type and ID directly from request. May be null for MISSING.
+
+    Status status   = 2;
+    float  quantity = 3; // Remaining quantity in MES server.
+
+    string id       = 4; // 材料料號
+    string level    = 5;
+
+    string date     = 6; // 製造/進貨/或建檔日期。
+    string expiryDate = 7;
+
+    // @cliff 查詢的結果需要多一個配方標準用量顯示在HMI上
+    float  standard_dosage = 8; //  配方用量
+    float  standard_error_margin = 9;
+
+    oneof reason {
+        BadLotIDReasons badLotIDReasons = 10;
+        BadQuantityReasons badQuantityReasons = 11;
+        InternalReasons internalReasons = 12;
+    }
+
+    string aux = 100;
+
+    map<string, string> properties = 102;
+
+}
+
+/*
+    對應白板的 Start :
+    1. 透過Context取得機台, 作業員工號, 工單ID, 首編號
+    2. Start代表該首已不會再投料, 承認先前ADD的所有紀錄 (COPY到SHEET BOM)
+    3. 檢查未ADD到齊的材料 (與RECIPE相比, 包含流水線上及桶槽) , 使用量以標準用量紀錄, 補齊沒ADD的資訊
+*/
+message StartRequest {
+    enum ContainerUseMode {
+        UNSPECIFIED_MODE = 0 ;
+        // 統槽全用
+        ALL = 1;
+        // 不指定統槽 , 自動從RECIPE相應桶槽抓資料, 確認標準量
+        SUBSET = 2;
+        // 指定統槽
+        ASSIGNED = 3 ;
+    }
+
+    ContainerUseMode container_use_mode = 1;
+
+    // MODE為ASSIGNED時, 需要給資料
+    repeated string container_id = 2;
+}
+message StartReply {
+    enum Status {
+        OK       = 0;
+        INTERNAL = 1;
+    }
+
+    enum InternalReasons {
+        UNSPECIFIED_INTERNAL_REASON = 0;
+        WRONG_BATCH_STATUS          = 1;
+        WRONG_WORK_ORDER_STATUS     = 2;
+    }
+
+    // reply status code
+    Status status                   = 1;
+    InternalReasons internalReasons = 2;
+}
+
+// @cliff : 像胎面或蓋膠這種只能用收料的秤的重量反推實重的工程，在START後紀錄的材料量都是標準量。
+//          Request是否需要加一個flag讓API判斷，是否要用收料量反推投料量，以補齊投料紀錄？ (而且看起來每個製程都要寫一段反推的程式)
+/*
+    白板沒有:  收料, 紀錄收料資訊
+    1. 透過Context取得機台, 作業員工號, 工單ID
+    2. 驗證材料標示卡是否正確, 載具是否存在
+    3. 檢查是否可收: 投入首數 - 產出首數
+    4. 更新工單, 首資訊, 更新庫存
+*/
+message OutRequest {
+    // 收料量
+    float qty              = 1;
+    // 標示卡條碼 (自動列印時不用)
+    string material_lot_id = 2;
+    // 載具條碼
+    string carrier_id      = 3;
+}
+
+message OutReply {
+    // reply status code
+    enum Status {
+        // 成功
+        OK         = 0;
+        INTERNAL   = 1;
+        BAD_LOT_ID = 2;
+    }
+
+    enum InternalReasons {
+        UNSPECIFIED_INTERNAL_REASON = 0;
+        WRONG_BATCH_STATUS          = 1;
+        WRONG_WORK_ORDER_STATUS     = 2;
+        NOT_FOUND_RECIPE_PROCESS    = 3;
+    }
+
+    enum BadLotIdReasons {
+        UNSPECIFIED_BAD_LOT_ID_REASON = 0;
+        MATERIAL_NON_EXISTENT         = 1;
+        MATERIAL_DUPLICATE            = 2;
+        CARRIER_NON_EXISTENT          = 3;
+    }
+
+    // reply status code
+    Status status = 1;
+
+    oneof reason {
+        BadLotIdReasons badLotIdReasons = 11;
+        InternalReasons internalReasons = 12;
+    }
+}
+
+// @cliff : 投料跟收料結束是否應該由工廠端程式判斷, 而非API自主變更狀態?
+/*
+    對應白板的 Close : 投料或收料結束, 變更工單狀態為下一狀態
+    1. 透過Context取得機台, 作業員工號, 工單ID, 並進行工單狀態切換
+    2. 當工單狀態為已開始投料(input) -> 更新為投料完畢(processing) ,
+       當工單狀態為投料完畢(processing) -> 更新為收料完畢(completed)
+*/
+message CloseRequest {
+}
+
+message CloseReply{
+    // reply status code
+    enum Status {
+        OK = 0 ;
+        WRONG_WORK_ORDER_STATUS = 1;
+        WAIT_FOR_INPUT          = 2;
+        WAIT_FOR_OUTPUT         = 3;
+    }
+
+    // reply status code
+    Status status = 1;
+}
+
+
+/*
+    白板沒有:  登入/登出 驗證
+    1. 從Context 取得機台, 作業員工號
+    2. 透過員工主檔驗證員工是否存在 (機台可以取得管理廠, 再取得子公司)
+*/
+message SignRequest{
+    enum Mode {
+        NONE = 0 ;
+        IN   = 1 ;
+        OUT  = 2 ;
+    }
+    // 登入/登出
+    Mode mode = 1;
+}
+message SignReply{
+    enum Status {
+        OK = 0 ;
+        PERMISSION_DENIED = 1;
+    }
+    Status status = 1;
+}

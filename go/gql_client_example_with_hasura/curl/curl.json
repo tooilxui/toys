@@ -1,0 +1,4 @@
+{
+    "query": "query ($spec: jsonb ){erp_json_test(where: {data: {_contains: $spec}}) {data}}",
+    "variables": {"spec": {"A": "aaa"}}
+}
